@@ -1,5 +1,7 @@
 # Digitale Leihquittung
 
+[45-Sekunden-Demovideo (MP4)](https://github.com/gingi1/tool-loan-base/releases/tag/v0.1.0-demo)
+
 Der Prototyp hält fest, wer eine Ausleihe und ihre Rückgabe bestätigt hat. Er speichert die beiden Wallet-Adressen, eine Werkzeug-ID, den Rückgabetermin und den Status. Wallet-Adressen und Werkzeug-ID sind öffentlich einsehbar. Verwende für die Demo ausschließlich Test-Wallets und neutrale IDs wie `bohrmaschine-01`. Der Vertrag hält keine Kaution.
 
 ## Bereits getestete Demo auf Base Sepolia
