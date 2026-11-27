@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digitale Leihquittung</title>
+<script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js" defer></script>
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; background: #f5f2e9; color: #222b28; font: 1rem/1.5 system-ui, sans-serif; }
+main { max-width: 720px; margin: auto; padding: 40px 18px; }
+h1 { font-size: clamp(2rem, 6vw, 3rem); margin: 0; }
+h2 { margin-top: 0; font-size: 1.25rem; }
+section { background: #fffdfa; border: 1px solid #ddd8c9; border-radius: 16px; padding: 20px; margin: 18px 0; }
+label, input { display: block; width: 100%; }
+label { margin-top: 12px; }
+input, button { font: inherit; padding: 9px 12px; border-radius: 8px; }
+input { border: 1px solid #989e98; background: white; color: inherit; }
+button { margin: 12px 6px 0 0; border: 0; background: #245d49; color: white; cursor: pointer; }
+button:disabled { opacity: .55; cursor: default; }
+[hidden] { display: none; }
+#status, #receipt, #account { overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Digitale Leihquittung</h1>
+  <p>Werkzeug ausleihen, Rückgabe melden und gemeinsam abschließen.</p>
+</header>
+<section aria-label="Testnetz und Wallet">
+  <label for="contract">Vertragsadresse auf Base Sepolia</label>
+  <input id="contract" placeholder="0x…" autocomplete="off">
+  <button id="connect" type="button">Test-Wallet verbinden</button>
+  <div id="accountChoice" hidden>
+    <label for="walletAccount">Wallet für diese Leihquittung</label>
+    <select id="walletAccount"></select>
+  </div>
+  <p id="account">Keine Wallet verbunden</p>
+  <p id="status" role="status"></p>
+</section>
+<section>
+  <h2>Ausleihe anlegen</h2>
+  <form id="offer">
+    <label for="borrower">Wallet der leihenden Person</label>
+    <input id="borrower" placeholder="0x…" required>
+    <label for="tool">Werkzeug-ID</label>
+    <input id="tool" value="bohrmaschine-01" maxlength="31" required>
+    <label for="due">Rückgabe bis (Ortszeit)</label>
+    <input id="due" type="datetime-local" required>
+    <button id="offerButton" disabled>Ausleihe anbieten</button>
+  </form>
+</section>
+<section>
+  <h2>Leihquittung ansehen</h2>
+  <form id="load">
+    <label for="loanId">Ausleihnummer</label>
+    <input id="loanId" inputmode="numeric" pattern="[1-9][0-9]*" required>
+    <button id="loadButton">Quittung laden</button>
+  </form>
+  <div id="receipt" aria-live="polite"></div>
+  <button id="accept" hidden>Ausleihe annehmen</button>
+  <button id="reportReturn" hidden>Rückgabe melden</button>
+  <button id="confirmReturn" hidden>Rückgabe bestätigen</button>
+  <button id="cancelOffer" hidden>Angebot zurückziehen</button>
+</section>
+</main>
+<script>
+window.addEventListener("DOMContentLoaded", () => {
+  const el = id => document.getElementById(id);
+  const status = message => { el("status").textContent = message; };
+  if (!window.ethers) {
+    status("Die Bibliothek konnte nicht geladen werden. Bitte lade die Seite erneut.");
+    return;
+  }
+
+  const network = { name: "base-sepolia", chainId: 84532 };
+  const rpc = new ethers.providers.StaticJsonRpcProvider(
+    { url: "https://sepolia.base.org", timeout: 12000 }, network
+  );
+  const abi = [
+    "function loans(uint256) view returns (address lender, address borrower, bytes32 toolId, uint64 dueAt, uint8 state)",
+    "function offer(address borrower, bytes32 toolId, uint64 dueAt) returns (uint256 loanId)",
+    "function accept(uint256 loanId)",
+    "function reportReturn(uint256 loanId)",
+    "function confirmReturn(uint256 loanId)",
+    "function cancelOffer(uint256 loanId)",
+    "event LoanOffered(uint256 indexed loanId, address indexed lender, address indexed borrower, bytes32 toolId, uint64 dueAt)"
+  ];
+  const states = ["Unbekannt", "Angeboten", "Ausgeliehen", "Rückgabe gemeldet", "Zurückgegeben", "Zurückgezogen"];
+  const actions = ["accept", "reportReturn", "confirmReturn", "cancelOffer"];
+  const controls = ["contract", "loanId", "connect", "walletAccount", "loadButton", "offerButton", ...actions];
+  const same = (a, b) => a?.toLowerCase() === b?.toLowerCase();
+  let account, loaded, busy = false;
+
+  function setWalletAccounts(accounts) {
+    const choice = el("walletAccount");
+    const selected = accounts.find(candidate => same(candidate, account)) || accounts[0];
+    choice.replaceChildren(...accounts.map(address => {
+      const option = document.createElement("option");
+      option.value = address;
+      option.textContent = address;
+      return option;
+    }));
+    choice.value = selected || "";
+    el("accountChoice").hidden = accounts.length < 2;
+    account = selected;
+    el("account").textContent = account || "Keine Wallet verbunden";
+    el("connect").textContent = account ? "Wallet-Freigabe ändern" : "Test-Wallet verbinden";
+    controlsChanged();
+  }
+
+  function controlsChanged() {
+    for (const id of controls) el(id).disabled = busy;
+    el("offerButton").disabled = busy || !account;
+    const loan = loaded?.loan;
+    const borrower = account && loan && same(account, loan.borrower);
+    const lender = account && loan && same(account, loan.lender);
+    el("accept").hidden = !(borrower && loan.state === 1 && Number(loan.dueAt) * 1000 > Date.now());
+    el("reportReturn").hidden = !(borrower && loan.state === 2);
+    el("confirmReturn").hidden = !(lender && loan.state === 3);
+    el("cancelOffer").hidden = !(lender && loan.state === 1);
+  }
+
+  async function run(task) {
+    if (busy) return;
+    busy = true;
+    controlsChanged();
+    try {
+      await task();
+    } catch (error) {
+      const rejected = error.code === 4001 || error.code === "ACTION_REJECTED";
+      status(rejected ? "In der Wallet abgelehnt." : error.reason || error.message);
+    } finally {
+      busy = false;
+      controlsChanged();
+    }
+  }
+
+  function contractAddress() {
+    return ethers.utils.getAddress(el("contract").value.trim());
+  }
+
+  function loanNumber() {
+    const id = el("loanId").value;
+    if (!/^[1-9][0-9]*$/.test(id)) throw new Error("Bitte gib eine gültige Ausleihnummer ein.");
+    return id;
+  }
+
+  function clearReceipt() {
+    loaded = undefined;
+    el("receipt").replaceChildren();
+    controlsChanged();
+  }
+
+  async function loadReceipt(address, id) {
+    const loan = await new ethers.Contract(address, abi, rpc).loans(id);
+    if (loan.state === 0) throw new Error("Diese Ausleihe existiert nicht.");
+    loaded = { address, id, loan };
+    let toolId = loan.toolId;
+    try { toolId = ethers.utils.parseBytes32String(toolId); } catch {}
+    const info = [
+      ["Ausleihe", "#" + id],
+      ["Werkzeug-ID", toolId],
+      ["Status", states[loan.state]],
+      ["Rückgabe bis", new Date(Number(loan.dueAt) * 1000).toLocaleString("de-AT")],
+      ["Verleiher", loan.lender],
+      ["Leihende Wallet", loan.borrower]
+    ];
+    const details = document.createElement("dl");
+    for (const [label, value] of info) {
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const description = document.createElement("dd");
+      description.textContent = value;
+      details.append(term, description);
+    }
+    el("receipt").replaceChildren(details);
+  }
+
+  async function signerContract(address) {
+    const wallet = window.ethereum;
+    const selected = account;
+    if (!wallet || !selected) throw new Error("Bitte verbinde eine Test-Wallet.");
+    const chainId = await wallet.request({ method: "eth_chainId" });
+    if (Number(chainId) !== network.chainId) throw new Error("Bitte wähle Base Sepolia in der Wallet.");
+    const accounts = await wallet.request({ method: "eth_accounts" });
+    if (!accounts.some(address => same(address, selected)) || !same(account, selected)) throw new Error("Bitte verbinde deine aktuelle Test-Wallet.");
+    if (await rpc.getCode(address) === "0x") throw new Error("Kein Vertrag an dieser Adresse gefunden.");
+    const provider = new ethers.providers.Web3Provider(wallet, network);
+    return new ethers.Contract(address, abi, provider.getSigner(selected));
+  }
+
+  async function send(address, action, args) {
+    const contract = await signerContract(address);
+    await contract.callStatic[action](...args);
+    status("Bitte bestätige die Testnetz-Transaktion in der Wallet.");
+    const tx = await contract[action](...args);
+    status("Gesendet. Warte auf Bestätigung für " + tx.hash);
+    let receipt;
+    try {
+      receipt = await tx.wait();
+    } catch (error) {
+      if (error.code !== "TRANSACTION_REPLACED" || error.cancelled ||
+          error.receipt?.status !== 1) throw error;
+      receipt = error.receipt;
+    }
+    return receipt;
+  }
+
+  el("connect").onclick = () => run(async () => {
+    const wallet = window.ethereum;
+    if (!wallet) throw new Error("Öffne die Seite in einem Browser mit Test-Wallet.");
+    if (account) {
+      await wallet.request({
+        method: "wallet_requestPermissions",
+        params: [{ eth_accounts: {} }]
+      });
+    }
+    const accounts = await wallet.request({ method: "eth_requestAccounts" });
+    if (!accounts.length) throw new Error("Keine Wallet ausgewählt.");
+    setWalletAccounts(accounts);
+    status("Wallet verbunden. Für Aktionen Base Sepolia wählen.");
+  });
+
+  el("offer").onsubmit = event => {
+    event.preventDefault();
+    return run(async () => {
+      const address = contractAddress();
+      const borrower = ethers.utils.getAddress(el("borrower").value.trim());
+      const toolId = ethers.utils.formatBytes32String(el("tool").value.trim());
+      const dueAt = Math.floor(new Date(el("due").value).getTime() / 1000);
+      if (!Number.isSafeInteger(dueAt) || dueAt <= Date.now() / 1000) {
+        throw new Error("Bitte gib ein Rückgabedatum in der Zukunft ein.");
+      }
+      const receipt = await send(address, "offer", [borrower, toolId, dueAt]);
+      const events = new ethers.utils.Interface(abi);
+      const log = receipt.logs.find(item =>
+        same(item.address, address) && item.topics[0] === events.getEventTopic("LoanOffered"));
+      const offered = log && events.parseLog(log);
+      if (!offered) {
+        status("Transaktion bestätigt. Ausleihnummer steht im Ereignis LoanOffered.");
+        return;
+      }
+      const id = offered.args.loanId.toString();
+      el("loanId").value = id;
+      status("Ausleihe #" + id + " bestätigt. Teile die Nummer mit der leihenden Person.");
+      await loadReceipt(address, id);
+    });
+  };
+
+  el("load").onsubmit = event => {
+    event.preventDefault();
+    return run(async () => {
+      clearReceipt();
+      await loadReceipt(contractAddress(), loanNumber());
+      status("Quittung geladen.");
+    });
+  };
+
+  for (const action of actions) {
+    el(action).onclick = () => run(async () => {
+      if (!loaded) return;
+      const { address, id } = loaded;
+      await send(address, action, [id]);
+      clearReceipt();
+      status("Ausleihe #" + id + " aktualisiert.");
+      await loadReceipt(address, id);
+    });
+  }
+
+  el("walletAccount").onchange = () => {
+    account = el("walletAccount").value;
+    el("account").textContent = account;
+    controlsChanged();
+  };
+  el("contract").oninput = clearReceipt;
+  el("loanId").oninput = clearReceipt;
+  if (window.ethereum?.on) {
+    window.ethereum.on("accountsChanged", setWalletAccounts);
+  }
+});
+</script>
+</body>
+</html>
+
